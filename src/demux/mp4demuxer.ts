@@ -3,6 +3,11 @@
  */
 import { dummyTrack } from './dummy-demuxed-track';
 import {
+  Mp4SampleAesDecrypter,
+  parseEncryptionData,
+  type TrackEncryptionDefaults,
+} from './mp4-sample-aes';
+import {
   type DemuxedAudioTrack,
   type DemuxedMetadataTrack,
   type DemuxedUserdataTrack,
@@ -25,6 +30,8 @@ import {
 import type { HlsConfig } from '../config';
 import type { HlsEventEmitter } from '../events';
 import type { IEmsgParsingData } from '../utils/mp4-tools';
+import type { DecryptData } from '../loader/level-key';
+import type { ChunkMetadata } from '../hls';
 
 const emsgSchemePattern = /\/emsg[-/]ID3/i;
 
@@ -36,6 +43,10 @@ class MP4Demuxer implements Demuxer {
   private audioTrack?: DemuxedAudioTrack;
   private id3Track?: DemuxedMetadataTrack;
   private txtTrack?: DemuxedUserdataTrack;
+  /** Encryption defaults parsed from the last SAMPLE-AES init segment. */
+  private encryptionData: Map<number, TrackEncryptionDefaults> | null = null;
+  /** Cached decrypter instance (reused across segments for a given key). */
+  private sampleAesDecrypter: Mp4SampleAesDecrypter | null = null;
 
   constructor(observer: HlsEventEmitter, config: HlsConfig) {
     this.config = config;
@@ -48,6 +59,8 @@ class MP4Demuxer implements Demuxer {
     audioCodec: string | undefined,
     videoCodec: string | undefined,
     trackDuration: number,
+    decryptdata?: DecryptData | null,
+    _chunkMeta?: ChunkMetadata,
   ) {
     const videoTrack = (this.videoTrack = dummyTrack(
       'video',
@@ -65,9 +78,20 @@ class MP4Demuxer implements Demuxer {
     this.id3Track = dummyTrack('id3', 1) as DemuxedMetadataTrack;
     this.timeOffset = 0;
 
+    // Reset SAMPLE-AES state; will be re-populated below if applicable.
+    this.encryptionData = null;
+    this.sampleAesDecrypter = null;
+
     if (!initSegment?.byteLength) {
       return;
     }
+
+    // Parse SAMPLE-AES encryption metadata from the init segment so that
+    // demuxSampleAes() can use it for per-segment decryption.
+    if (decryptdata?.method === 'SAMPLE-AES') {
+      this.encryptionData = parseEncryptionData(initSegment);
+    }
+
     const initData = parseInitSegment(initSegment);
 
     if (initData.video) {
@@ -199,13 +223,58 @@ class MP4Demuxer implements Demuxer {
     return id3Track;
   }
 
+  /**
+   * Decrypt a SAMPLE-AES protected fMP4 media segment and return the result
+   * through the normal demux pipeline.
+   *
+   * Algorithm:
+   *  1. Resolve (or lazily create) an `Mp4SampleAesDecrypter` for the current
+   *     key.  The decrypter carries the software AES context and per-track
+   *     encryption defaults parsed from the init segment.
+   *  2. Call `decryptSegment()` which:
+   *     a. Copies the segment bytes.
+   *     b. Decrypts every sample according to the cbcs pattern + senc IVs.
+   *     c. Renames `senc` / `saiz` / `saio` boxes to `free`.
+   *  3. Push the plain-text bytes through the regular `demux()` path.
+   */
   demuxSampleAes(
     data: Uint8Array,
     keyData: KeyData,
     timeOffset: number,
+    _chunkMeta?: ChunkMetadata,
   ): Promise<DemuxerResult> {
-    return Promise.reject(
-      new Error('The MP4 demuxer does not support SAMPLE-AES decryption'),
+    const { encryptionData } = this;
+    if (!encryptionData || encryptionData.size === 0) {
+      return Promise.reject(
+        new Error(
+          'MP4 SAMPLE-AES: no track encryption data found in init segment. ' +
+            'Ensure resetInitSegment() is called with a SAMPLE-AES init segment ' +
+            'before demuxSampleAes().',
+        ),
+      );
+    }
+
+    // Lazily create (or reuse) the decrypter for this key.
+    // The decrypter caches the expanded AES key schedule across segments.
+    let { sampleAesDecrypter } = this;
+    if (!sampleAesDecrypter) {
+      sampleAesDecrypter = this.sampleAesDecrypter = new Mp4SampleAesDecrypter(
+        keyData,
+        encryptionData,
+      );
+    }
+
+    let decryptedData: Uint8Array;
+    try {
+      decryptedData = sampleAesDecrypter.decryptSegment(
+        data as Uint8Array<ArrayBuffer>,
+      );
+    } catch (err) {
+      return Promise.reject(err);
+    }
+
+    return Promise.resolve(
+      this.demux(decryptedData as Uint8Array<ArrayBuffer>, timeOffset),
     );
   }
 
@@ -213,6 +282,8 @@ class MP4Demuxer implements Demuxer {
     // @ts-ignore
     this.config = null;
     this.remainderData = null;
+    this.encryptionData = null;
+    this.sampleAesDecrypter = null;
     this.videoTrack =
       this.audioTrack =
       this.id3Track =

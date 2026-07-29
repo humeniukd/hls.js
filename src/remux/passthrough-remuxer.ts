@@ -8,7 +8,9 @@ import { type ILogger, Logger } from '../utils/logger';
 import {
   patchEncyptionData,
   remuxVideoOnlyIFrameMoof,
+  stripEncryptionFromInitSegment,
   videoOnlyInitSegment,
+  writeUint32,
 } from '../utils/mp4-tools';
 import { getSampleData, parseInitSegment } from '../utils/mp4-tools';
 import type { HlsConfig } from '../config';
@@ -112,11 +114,21 @@ class PassThroughRemuxer extends Logger implements Remuxer {
       this.initData = undefined;
       return;
     }
+
+    if (decryptdata?.method === 'SAMPLE-AES') {
+      // For SAMPLE-AES fMP4, the JS pipeline decrypts every sample in-band.
+      // Strip the enca/encv encryption wrapping from the init segment so that
+      // MSE sees plain codec boxes (avc1, mp4a, …) and does not require EME.
+      // The stripped segment is a copy; the original is not mutated.
+      initSegment = stripEncryptionFromInitSegment(initSegment);
+    } else if (decryptdata) {
+      // For CMAF/cenc content, patch the default key ID in tenc boxes.
+      patchEncyptionData(initSegment, decryptdata);
+    }
+
     const { audio, video } = (this.initData = parseInitSegment(initSegment));
 
-    if (decryptdata) {
-      patchEncyptionData(initSegment, decryptdata);
-    } else {
+    if (!decryptdata) {
       const eitherTrack = audio || video;
       if (eitherTrack?.encrypted) {
         this.warn(

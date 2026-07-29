@@ -74,12 +74,12 @@ export const RemuxerTrackIdConfig = {
   text: 4,
 };
 
-function readUint16(buffer: Uint8Array, offset: number): number {
+export function readUint16(buffer: Uint8Array, offset: number): number {
   const val = (buffer[offset] << 8) | buffer[offset + 1];
   return val < 0 ? 65536 + val : val;
 }
 
-function readUint32(buffer: Uint8Array, offset: number): number {
+export function readUint32(buffer: Uint8Array, offset: number): number {
   const val = readSint32(buffer, offset);
   return val < 0 ? 4294967296 + val : val;
 }
@@ -91,7 +91,7 @@ function readUint64(buffer: Uint8Array, offset: number) {
   return result;
 }
 
-function readSint32(buffer: Uint8Array, offset: number): number {
+export function readSint32(buffer: Uint8Array, offset: number): number {
   return (
     (buffer[offset] << 24) |
     (buffer[offset + 1] << 16) |
@@ -960,6 +960,78 @@ function applyToTencBoxes(
       });
     });
   });
+}
+
+/**
+ * Strip SAMPLE-AES encryption wrapping from an fMP4 init segment so that the
+ * result can be fed to MSE without requiring EME.
+ *
+ * Transformations applied (in-place on a copy):
+ *  1. The FourCC of every `encv` / `enca` sample-entry box is replaced with
+ *     the original codec FourCC found in `sinf > frma`.
+ *  2. Every `sinf` box is renamed to `free` so ISO-BMFF parsers ignore it
+ *     (the box size is preserved, keeping all byte offsets valid).
+ *
+ * After this transformation `parseInitSegment` will return `encrypted: false`
+ * for all tracks, and MSE will accept the segment without a CDM.
+ */
+export function stripEncryptionFromInitSegment(
+  initSegment: Uint8Array,
+): Uint8Array<ArrayBuffer> {
+  // Create a flat, zero-byteOffset copy so that `subarray.byteOffset` values
+  // computed by findBox() are directly usable as indices into `data`.
+  const data = new Uint8Array(
+    initSegment.buffer.slice(
+      initSegment.byteOffset,
+      initSegment.byteOffset + initSegment.byteLength,
+    ),
+  ) as Uint8Array<ArrayBuffer>;
+
+  const traks = findBox(data, ['moov', 'trak']);
+  for (const trak of traks) {
+    const stsdBox = findBox(trak, ['mdia', 'minf', 'stbl', 'stsd'])[0];
+    if (!stsdBox) continue;
+
+    // Skip FullBox header (version + flags + entry_count = 8 bytes)
+    const sampleEntries = stsdBox.subarray(8);
+
+    for (const [encType, headerOff] of [
+      ['encv', 78 /* VisualSampleEntry header bytes before codec boxes */],
+      ['enca', 28 /* AudioSampleEntry header bytes before codec boxes */],
+    ] as [string, number][]) {
+      const encBoxes = findBox(sampleEntries, [encType]);
+      for (const encContent of encBoxes) {
+        // encContent.byteOffset - 4 is the position of the FourCC field
+        // ('encv' / 'enca') in the underlying `data` buffer.
+        const fourCCPos = encContent.byteOffset - 4;
+
+        // Descend past the sample-entry header to reach codec-specific boxes
+        const encChildren = encContent.subarray(headerOff);
+        const sinfs = findBox(encChildren, ['sinf']);
+        for (const sinf of sinfs) {
+          // Retrieve original codec FourCC from frma (Format box)
+          const frma = findBox(sinf, ['frma'])[0];
+          if (!frma) continue;
+
+          // 1. Replace 'encv' / 'enca' with the original codec FourCC
+          data[fourCCPos] = frma[0];
+          data[fourCCPos + 1] = frma[1];
+          data[fourCCPos + 2] = frma[2];
+          data[fourCCPos + 3] = frma[3];
+
+          // 2. Rename 'sinf' → 'free' (ignored by ISOBMFF parsers / MSE)
+          //    sinf.byteOffset - 4 is the FourCC position of the sinf box.
+          const sinfFourCCPos = sinf.byteOffset - 4;
+          data[sinfFourCCPos] = 0x66; // 'f'
+          data[sinfFourCCPos + 1] = 0x72; // 'r'
+          data[sinfFourCCPos + 2] = 0x65; // 'e'
+          data[sinfFourCCPos + 3] = 0x65; // 'e'
+        }
+      }
+    }
+  }
+
+  return data;
 }
 
 export function parseSinf(sinf: Uint8Array): BoxDataOrUndefined {

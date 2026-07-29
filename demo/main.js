@@ -1,6 +1,8 @@
 /* global $, Hls, __CLOUDFLARE_PAGES__ */
 /* eslint camelcase: 0 */
 
+import Hls from '../dist/hls.light.mjs';
+
 import { pack } from 'jsonpack';
 import 'promise-polyfill/src/polyfill';
 import { sortObject, copyTextToClipboard } from './demo-utils';
@@ -32,6 +34,7 @@ if (demoConfigParam) {
 const hlsjsDefaults = {
   debug: true,
   enableWorker: true,
+  workerPath: '../dist/hls.worker.js',
   lowLatencyMode: true,
   backBufferLength: 60 * 1.5,
 };

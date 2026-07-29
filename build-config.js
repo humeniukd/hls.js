@@ -446,8 +446,8 @@ const configs = Object.entries({
     onLog: buildOnLog(),
     output: {
       name: 'HlsDemo',
-      file: './dist/hls-demo.js',
-      format: FORMAT.umd,
+      file: './dist/hls-demo.mjs',
+      format: FORMAT.esm,
       sourcemap: true,
       sourcemapFile: 'hls-demo.js.map',
     },
